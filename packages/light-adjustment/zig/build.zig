@@ -1,18 +1,14 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 // Although this function looks imperative, note that its job is to
 // declaratively construct a build graph that will be executed by an external
 // runner.
-pub fn build(b: *std.Build) void {
+pub fn build(b: *std.Build) !void {
     // Standard target options allows the person running `zig build` to choose
     // what target to build for. Here we do not override the defaults, which
     // means any target is allowed, and the default is native. Other options
     // for restricting supported target set are available.
-
-    // 以下のオプションを指定すれば wasm 用にビルドできるが、ユニットテスト実行が失敗するので、
-    // 代わりに `$ zig build -Dtarget=wasm32-freestanding` のようにビルド時にコマンドライン引数を指定することで対処する
-    // const target = b.standardTargetOptions(.{ .default_target = .{ .cpu_arch = .wasm32, .os_tag = .freestanding } });
-    const target = b.standardTargetOptions(.{});
 
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
@@ -25,7 +21,12 @@ pub fn build(b: *std.Build) void {
         // In this case the main source file is merely a path, however, in more
         // complicated build scripts, this could be a generated file.
         .root_source_file = .{ .path = "src/wasm.zig" },
-        .target = target,
+        .target = .{
+            .cpu_arch = .wasm32,
+            .cpu_model = .{ .explicit = &std.Target.wasm.cpu.mvp },
+            .cpu_features_add = std.Target.wasm.featureSet(&.{.simd128}),
+            .os_tag = .freestanding,
+        },
         .optimize = optimize,
     });
     lib.rdynamic = true;
@@ -38,7 +39,6 @@ pub fn build(b: *std.Build) void {
     // Creates a step for unit testing.
     const main_tests = b.addTest(.{
         .root_source_file = .{ .path = "src/main.zig" },
-        .target = target,
         .optimize = optimize,
     });
 

@@ -1,9 +1,12 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const math = std.math;
 const ArrayList = std.ArrayList;
 const Allocator = std.mem.Allocator;
 const expect = std.testing.expect;
 const test_allocator = std.testing.allocator;
+
+const vector_size = 32;
 
 pub const Mask = struct {
     data: []u8,
@@ -51,10 +54,30 @@ pub const Image = struct {
         };
     }
 
+    fn getRgbVector(self: Self, offset: usize) RgbVector {
+        var r: @Vector(vector_size, u8) = undefined;
+        var g: @Vector(vector_size, u8) = undefined;
+        var b: @Vector(vector_size, u8) = undefined;
+        for (0..vector_size) |i| {
+            r[i] = self.data[offset + 4 * i + 0];
+            g[i] = self.data[offset + 4 * i + 1];
+            b[i] = self.data[offset + 4 * i + 2];
+        }
+        return RgbVector{ .r = r, .g = g, .b = b };
+    }
+
     fn setRgb(self: Self, offset: usize, rgb: Rgb) void {
         self.data[offset] = rgb.r;
         self.data[offset + 1] = rgb.g;
         self.data[offset + 2] = rgb.b;
+    }
+
+    fn setRgbVector(self: Self, offset: usize, rgbVector: RgbVector) void {
+        for (0..vector_size) |i| {
+            self.data[offset + 4 * i + 0] = rgbVector.r[i];
+            self.data[offset + 4 * i + 1] = rgbVector.g[i];
+            self.data[offset + 4 * i + 2] = rgbVector.b[i];
+        }
     }
 };
 
@@ -109,6 +132,16 @@ pub const Agcwd = struct {
 
     pub fn enhanceImage(self: Self, image: *Image) void {
         var i: usize = 0;
+        if (std.Target.wasm.featureSetHas(builtin.cpu.features, .simd128)) {
+            while (i + 4 * vector_size <= image.data.len) : (i += 4 * vector_size) {
+                const rgb_vector = image.getRgbVector(i);
+                var hsv_vector = rgb_vector.toHsvVector();
+                for (0..vector_size) |j| {
+                    hsv_vector.v[j] = self.mapping_curve[hsv_vector.v[j]];
+                }
+                image.setRgbVector(i, hsv_vector.toRgbVector());
+            }
+        }
         while (i < image.data.len) : (i += 4) {
             const rgb = image.getRgb(i);
             var hsv = rgb.toHsv();
@@ -308,6 +341,195 @@ const Hsv = struct {
     }
 };
 
+const RgbVector = struct {
+    const Self = @This();
+    const Vu8 = @Vector(vector_size, u8);
+    const V16 = @Vector(vector_size, i16);
+
+    r: Vu8,
+    g: Vu8,
+    b: Vu8,
+
+    fn toHsvVector(self: Self) HsvVector {
+        const max = @max(self.r, @max(self.g, self.b));
+        const min = @min(self.r, @min(self.g, self.b));
+        const n = max - min;
+        var v255max: Vu8 = undefined;
+        var v255n: V16 = undefined;
+        var r: V16 = undefined;
+        var g: V16 = undefined;
+        var b: V16 = undefined;
+        for (0..vector_size) |i| {
+            if (max[i] == 0) {
+                v255max[i] = 0;
+            } else {
+                v255max[i] = @divExact(255, max[i]);
+            }
+            if (n[i] == 0) {
+                v255n[i] = 0;
+            } else {
+                v255n[i] = @divExact(255, n[i]);
+            }
+            r[i] = @intCast(i16, self.r[i]);
+            g[i] = @intCast(i16, self.g[i]);
+            b[i] = @intCast(i16, self.b[i]);
+        }
+
+        const s = n * v255max;
+        const v = max;
+        const vu8_0 = @splat(vector_size, @intCast(u8, 0));
+        const vi16_0 = @splat(vector_size, @intCast(i16, 0));
+        const h = @select(
+            i16,
+            n == vu8_0,
+            vi16_0,
+            @select(
+                i16,
+                max == self.r,
+                @select(
+                    i16,
+                    self.g < self.b,
+                    @splat(vector_size, @intCast(i16, 6 * 255)) + (g * v255n) - (b * v255n),
+                    (g - b) * v255n,
+                ),
+                @select(
+                    i16,
+                    max == self.g,
+                    @splat(vector_size, @intCast(i16, 2 * 255)) + b * v255n - r * v255n,
+                    @splat(vector_size, @intCast(i16, 4 * 255)) + r * v255n - g * v255n,
+                ),
+            ),
+        );
+        var hu8: Vu8 = undefined;
+        for (0..vector_size) |i| {
+            hu8[i] = @intCast(u8, @divTrunc(h[i], 6));
+        }
+
+        return .{ .h = hu8, .s = s, .v = v };
+    }
+};
+
+const HsvVector = struct {
+    const Self = @This();
+    const Vu8 = @Vector(vector_size, u8);
+    const Vu32 = @Vector(vector_size, u32);
+
+    h: Vu8,
+    s: Vu8,
+    v: Vu8,
+
+    fn toRgbVector(self: Self) RgbVector {
+        const h: Vu32 = self.h;
+        const s: Vu32 = self.s;
+        const v: Vu32 = self.v;
+
+        const h6: Vu32 = h * @splat(vector_size, @intCast(u32, 6));
+        const v255 = @splat(vector_size, @intCast(u32, 255));
+
+        const f = h6 % v255;
+        const h6div255 = h6 / v255;
+
+        const r = @select(
+            u32,
+            s == @splat(vector_size, @intCast(u32, 0)),
+            v,
+            @select(
+                u32,
+                h6div255 == @splat(vector_size, @intCast(u32, 1)),
+                v * (v255 * v255 - s * f) / (v255 * v255),
+                @select(
+                    u32,
+                    h6div255 == @splat(vector_size, @intCast(u32, 2)),
+                    v * (v255 - s) / v255,
+                    @select(
+                        u32,
+                        h6div255 == @splat(vector_size, @intCast(u32, 3)),
+                        v * (v255 - s) / v255,
+                        @select(
+                            u32,
+                            h6div255 == @splat(vector_size, @intCast(u32, 4)),
+                            v * (v255 * v255 - s * (v255 - f)) / (v255 * v255),
+                            v,
+                        ),
+                    ),
+                ),
+            ),
+        );
+        const g = @select(
+            u32,
+            s == @splat(vector_size, @intCast(u32, 0)),
+            v,
+            @select(
+                u32,
+                h6div255 == @splat(vector_size, @intCast(u32, 1)),
+                v,
+                @select(
+                    u32,
+                    h6div255 == @splat(vector_size, @intCast(u32, 2)),
+                    v,
+                    @select(
+                        u32,
+                        h6div255 == @splat(vector_size, @intCast(u32, 3)),
+                        v * (v255 * v255 - s * f) / (v255 * v255),
+                        @select(
+                            u32,
+                            h6div255 == @splat(vector_size, @intCast(u32, 4)),
+                            v * (v255 - s) / v255,
+                            @select(
+                                u32,
+                                h6div255 == @splat(vector_size, @intCast(u32, 5)),
+                                v * (v255 - s) / v255,
+                                v * (v255 * v255 - s * (v255 - f)) / (v255 * v255),
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        const b = @select(
+            u32,
+            s == @splat(vector_size, @intCast(u32, 0)),
+            v,
+            @select(
+                u32,
+                h6div255 == @splat(vector_size, @intCast(u32, 1)),
+                v * (v255 - s) / v255,
+                @select(
+                    u32,
+                    h6div255 == @splat(vector_size, @intCast(u32, 2)),
+                    v * (v255 * v255 - s * (v255 - f)) / (v255 * v255),
+                    @select(
+                        u32,
+                        h6div255 == @splat(vector_size, @intCast(u32, 3)),
+                        v,
+                        @select(
+                            u32,
+                            h6div255 == @splat(vector_size, @intCast(u32, 4)),
+                            v,
+                            @select(
+                                u32,
+                                h6div255 == @splat(vector_size, @intCast(u32, 5)),
+                                v * (v255 * v255 - s * f) / (v255 * v255),
+                                v * (v255 - s) / v255,
+                            ),
+                        ),
+                    ),
+                ),
+            ),
+        );
+        var ru8: Vu8 = undefined;
+        var gu8: Vu8 = undefined;
+        var bu8: Vu8 = undefined;
+        for (0..vector_size) |i| {
+            ru8[i] = @truncate(u8, r[i]);
+            gu8[i] = @truncate(u8, g[i]);
+            bu8[i] = @truncate(u8, b[i]);
+        }
+
+        return .{ .r = ru8, .g = gu8, .b = bu8 };
+    }
+};
+
 test "RGB to HSV to RGB" {
     const inputs = .{
         Rgb{ .r = 255, .g = 0, .b = 0 },
@@ -321,6 +543,128 @@ test "RGB to HSV to RGB" {
         try expect(try math.absInt(@intCast(i9, rgb.r) - @intCast(i9, original_rgb.r)) <= 2);
         try expect(try math.absInt(@intCast(i9, rgb.g) - @intCast(i9, original_rgb.g)) <= 2);
         try expect(try math.absInt(@intCast(i9, rgb.b) - @intCast(i9, original_rgb.b)) <= 2);
+    }
+}
+test "RgbVector to HsvVector to RgbVector" {
+    const original_rgb_vector = RgbVector{
+        .r = @Vector(vector_size, u8){
+            0,
+            0,
+            0,
+            255,
+            0,
+            255,
+            255,
+            255,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        },
+        .g = @Vector(vector_size, u8){
+            0,
+            0,
+            255,
+            0,
+            255,
+            0,
+            255,
+            255,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        },
+        .b = @Vector(vector_size, u8){
+            0,
+            255,
+            0,
+            0,
+            255,
+            255,
+            0,
+            255,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        },
+    };
+    const hsv_vector = original_rgb_vector.toHsvVector();
+    for (0..vector_size) |i| {
+        const rgb = Rgb{ .r = original_rgb_vector.r[i], .g = original_rgb_vector.g[i], .b = original_rgb_vector.b[i] };
+        const hsv = rgb.toHsv();
+        try expect(hsv.h == hsv_vector.h[i]);
+        try expect(hsv.s == hsv_vector.s[i]);
+        try expect(hsv.v == hsv_vector.v[i]);
+    }
+    const rgb_vector = hsv_vector.toRgbVector();
+    for (0..vector_size) |i| {
+        const hsv = Hsv{ .h = hsv_vector.h[i], .s = hsv_vector.s[i], .v = hsv_vector.v[i] };
+        const rgb = hsv.toRgb();
+        try expect(rgb_vector.r[i] == rgb.r);
+        try expect(rgb_vector.g[i] == rgb.g);
+        try expect(rgb_vector.b[i] == rgb.b);
     }
 }
 

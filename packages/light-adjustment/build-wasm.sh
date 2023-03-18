@@ -3,7 +3,7 @@
 set -eux
 
 cd zig/
-zig build -Doptimize=ReleaseFast -Dtarget=wasm32-freestanding
+zig build -Doptimize=ReleaseFast
 cd ..
 
 mkdir -p dist/
