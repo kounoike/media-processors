@@ -1,5 +1,5 @@
 const std = @import("std");
-const allocator = std.heap.wasm_allocator;
+const allocator = std.heap.page_allocator;
 
 const light_adjustment = @import("./main.zig");
 const Mask = light_adjustment.Mask;
@@ -74,12 +74,14 @@ export fn agcwdNew() ?*anyopaque {
     const agcwd = allocator.create(Agcwd) catch return null;
     errdefer allocator.destroy(agcwd);
 
-    agcwd.* = Agcwd.init(.{});
+    agcwd.* = Agcwd.init(allocator, .{}) catch return null;
+    errdefer agcwd.deinit();
     return agcwd;
 }
 
 export fn agcwdFree(agcwd_ptr: *anyopaque) void {
     const agcwd = wasmPtrCast(*const Agcwd, agcwd_ptr);
+    agcwd.deinit();
     allocator.destroy(agcwd);
 }
 

@@ -78,10 +78,13 @@ pub const Agcwd = struct {
     options: AgcwdOptions,
     entropy: f32 = -1.0,
     mapping_curve: [256]u8,
+    rgbToHsv: *[256][256][256]Hsv,
+    hsvToRgb: *[256][256][256]Rgb,
+    allocator: Allocator,
 
     const Self = @This();
 
-    pub fn init(options: AgcwdOptions) Self {
+    pub fn init(allocator: Allocator, options: AgcwdOptions) !Self {
         // updateState() が呼ばれるまでは入力画像と出力画像が一致するマッピングとなる
         // (実際には RGB <-> HSV 変換による誤差の影響によって微妙に変化する）
         var mapping_curve: [256]u8 = undefined;
@@ -89,7 +92,24 @@ pub const Agcwd = struct {
             mapping_curve[i] = @truncate(u8, i);
         }
 
-        return .{ .options = options, .mapping_curve = mapping_curve };
+        var ret: Self = .{ .allocator = allocator, .options = options, .mapping_curve = mapping_curve, .rgbToHsv = try allocator.create([256][256][256]Hsv), .hsvToRgb = try allocator.create([256][256][256]Rgb) };
+        for (0..256) |i| {
+            for (0..256) |j| {
+                for (0..256) |k| {
+                    const rgb = Rgb{ .r = @truncate(u8, i), .g = @truncate(u8, j), .b = @truncate(u8, k) };
+                    ret.rgbToHsv.*[i][j][k] = rgb.toHsv();
+                    const hsv = Hsv{ .h = @truncate(u8, i), .s = @truncate(u8, j), .v = @truncate(u8, k) };
+                    ret.hsvToRgb.*[i][j][k] = hsv.toRgb();
+                }
+            }
+        }
+
+        return ret;
+    }
+
+    pub fn deinit(self: Self) void {
+        self.allocator.destroy(self.rgbToHsv);
+        self.allocator.destroy(self.hsvToRgb);
     }
 
     pub fn isStateObsolete(self: Self, image: Image) bool {
@@ -110,10 +130,9 @@ pub const Agcwd = struct {
     pub fn enhanceImage(self: Self, image: *Image) void {
         var i: usize = 0;
         while (i < image.data.len) : (i += 4) {
-            const rgb = image.getRgb(i);
-            var hsv = rgb.toHsv();
+            var hsv = self.rgbToHsv.*[image.data[i]][image.data[i + 1]][image.data[i + 2]];
             hsv.v = self.mapping_curve[hsv.v];
-            image.setRgb(i, hsv.toRgb());
+            image.setRgb(i, self.hsvToRgb.*[hsv.h][hsv.s][hsv.v]);
         }
     }
 };
@@ -329,7 +348,8 @@ test "Enhance image" {
     var image = try Image.fromSlice(&data);
     defer image.deinit();
 
-    var agcwd = Agcwd.init(.{});
+    var agcwd = Agcwd.init(test_allocator, .{});
+    defer agcwd.deinit();
 
     // 最初は常に状態の更新が必要
     try expect(agcwd.isStateObsolete(image));
