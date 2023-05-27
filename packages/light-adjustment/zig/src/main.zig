@@ -197,9 +197,9 @@ const RgbI32 = struct {
 
     fn blend(self: Self, original: Rgb, level: u8) Rgb {
         return .{
-            .r = @truncate(u8, (@intCast(u32, self.r) * level + @intCast(u32, original.r) * (100 - level)) / 100),
-            .g = @truncate(u8, (@intCast(u32, self.g) * level + @intCast(u32, original.g) * (100 - level)) / 100),
-            .b = @truncate(u8, (@intCast(u32, self.b) * level + @intCast(u32, original.b) * (100 - level)) / 100),
+            .r = @truncate(u8, (@intCast(u32, self.r) * level + @intCast(u32, original.r) * (128 - level)) >> 7),
+            .g = @truncate(u8, (@intCast(u32, self.g) * level + @intCast(u32, original.g) * (128 - level)) >> 7),
+            .b = @truncate(u8, (@intCast(u32, self.b) * level + @intCast(u32, original.b) * (128 - level)) >> 7),
         };
     }
 };
@@ -390,12 +390,57 @@ const Sharpener = struct {
         if (level == 0) {
             return;
         }
+        comptime var vec_size = std.simd.suggestVectorSize(u8) orelse unreachable;
 
         const filter = [_]i8{ 0, -1, 0, -1, 5, -1, 0, -1, 0 };
+        const filter16 = [_]i16{ 0, -1, 0, -1, 5, -1, 0, -1, 0 };
         std.mem.copy(u8, self.temp_image.data, image.data);
 
         for (0..image.height) |y| {
-            for (0..image.width) |x| {
+            var x: usize = 0;
+            while (x + vec_size < image.width - 3) : (x += vec_size) {
+                var processed_r = @splat(vec_size, @as(i16, 0));
+                var processed_g = @splat(vec_size, @as(i16, 0));
+                var processed_b = @splat(vec_size, @as(i16, 0));
+                for (0..3) |fy| {
+                    if ((fy == 0 and y == 0) or (fy == 2 and y + 1 == image.height)) {
+                        continue;
+                    }
+                    for (0..3) |fx| {
+                        const f = @splat(vec_size, @as(i16, filter16[fy * 3 + fx]));
+                        const vec8: @Vector(vec_size * 4, u8) = self.temp_image.data[(y + fy - 1) * image.width * 4 + (x + fx - 1) * 4 ..][0 .. vec_size * 4].*;
+                        const rgba8 = std.simd.deinterlace(4, vec8);
+                        const r = @intCast(@Vector(vec_size, i16), rgba8[0]);
+                        const g = @intCast(@Vector(vec_size, i16), rgba8[1]);
+                        const b = @intCast(@Vector(vec_size, i16), rgba8[2]);
+                        processed_r += r * f;
+                        processed_g += g * f;
+                        processed_b += b * f;
+                    }
+                }
+                const original_vec8: @Vector(vec_size * 4, u8) = self.temp_image.data[y * image.width * 4 + x * 4 ..][0 .. vec_size * 4].*;
+                const original_vec16 = @intCast(@Vector(vec_size * 4, i16), original_vec8);
+                const original_rgba = std.simd.deinterlace(4, original_vec16);
+
+                const level_vec = @splat(vec_size, @as(i16, level));
+                const level2_vec = @splat(vec_size, @as(i16, 128 - level));
+                const vec7 = @splat(vec_size, @as(i16, 7));
+                const blend_r = (processed_r * level_vec + original_rgba[0] * level2_vec) >> vec7;
+                const blend_g = (processed_g * level_vec + original_rgba[1] * level2_vec) >> vec7;
+                const blend_b = (processed_b * level_vec + original_rgba[2] * level2_vec) >> vec7;
+
+                const vec255 = @splat(vec_size, @as(i16, 255));
+                const vec0 = @splat(vec_size, @as(i16, 0));
+                const blend_r8 = @intCast(@Vector(vec_size, u8), @max(vec0, @min(vec255, blend_r)));
+                const blend_g8 = @intCast(@Vector(vec_size, u8), @max(vec0, @min(vec255, blend_g)));
+                const blend_b8 = @intCast(@Vector(vec_size, u8), @max(vec0, @min(vec255, blend_b)));
+                const blend_a8 = @splat(vec_size, @as(u8, 255));
+
+                const blend = std.simd.interlace(.{ blend_r8, blend_g8, blend_b8, blend_a8 });
+
+                image.data[y * image.width * 4 + x * 4 ..][0 .. vec_size * 4].* = blend;
+            }
+            while (x < image.width) : (x += 1) {
                 var processed = RgbI32.init();
                 for (0..3) |fy| {
                     if ((fy == 0 and y == 0) or (fy == 2 and y + 1 == image.height)) {
