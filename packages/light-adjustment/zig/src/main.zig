@@ -166,6 +166,51 @@ const RgbaImage = struct {
     }
 };
 
+/// SoA形式でRGB画像を表現する構造体。
+const RgbImageSoA = struct {
+    const Self = @This();
+
+    width: u32,
+    height: u32,
+
+    r: []i16,
+    g: []i16,
+    b: []i16,
+
+    allocator: Allocator,
+
+    fn init(allocator: Allocator, width: u32, height: u32) !Self {
+        const r = try allocator.alloc(i16, width * height);
+        const g = try allocator.alloc(i16, width * height);
+        const b = try allocator.alloc(i16, width * height);
+        return .{ .width = width, .height = height, .r = r, .g = g, .b = b, .allocator = allocator };
+    }
+
+    fn deinit(self: Self) void {
+        self.allocator.free(self.r);
+        self.allocator.free(self.g);
+        self.allocator.free(self.b);
+    }
+
+    fn fromRgbaImage(self: Self, image: *const RgbaImage) void {
+        if (image.width != self.width or image.height != self.height) return;
+        comptime var vec_size = std.simd.suggestVectorSize(u8) orelse unreachable;
+        var idx: usize = 0;
+        while (idx + vec_size < image.width * image.height) : (idx += vec_size) {
+            const vec: @Vector(vec_size * 4, u8) = image.data[idx * 4 ..][0 .. vec_size * 4].*;
+            const rgba = std.simd.deinterlace(4, vec);
+            self.r[idx..][0..vec_size].* = @intCast(@Vector(vec_size, i16), rgba[0]);
+            self.g[idx..][0..vec_size].* = @intCast(@Vector(vec_size, i16), rgba[1]);
+            self.b[idx..][0..vec_size].* = @intCast(@Vector(vec_size, i16), rgba[2]);
+        }
+        while (idx < image.width * image.height) : (idx += 4) {
+            self.r[idx] = @intCast(i16, image.data[idx * 4]);
+            self.g[idx] = @intCast(i16, image.data[idx * 4 + 1]);
+            self.b[idx] = @intCast(i16, image.data[idx * 4 + 2]);
+        }
+    }
+};
+
 const Rgb = struct {
     const Self = @This();
 
@@ -197,9 +242,9 @@ const RgbI32 = struct {
 
     fn blend(self: Self, original: Rgb, level: u8) Rgb {
         return .{
-            .r = @truncate(u8, (@intCast(u32, self.r) * level + @intCast(u32, original.r) * (128 - level)) >> 7),
-            .g = @truncate(u8, (@intCast(u32, self.g) * level + @intCast(u32, original.g) * (128 - level)) >> 7),
-            .b = @truncate(u8, (@intCast(u32, self.b) * level + @intCast(u32, original.b) * (128 - level)) >> 7),
+            .r = @truncate(u8, (@intCast(u32, self.r) * level + @intCast(u32, original.r) * (64 - level)) >> 6),
+            .g = @truncate(u8, (@intCast(u32, self.g) * level + @intCast(u32, original.g) * (64 - level)) >> 6),
+            .b = @truncate(u8, (@intCast(u32, self.b) * level + @intCast(u32, original.b) * (64 - level)) >> 6),
         };
     }
 };
@@ -371,12 +416,12 @@ const Sharpener = struct {
     const Self = @This();
 
     /// 処理中の一時データを保持するためのフィールド。
-    temp_image: RgbaImage,
+    temp_image: RgbImageSoA,
 
     allocator: Allocator,
 
     fn init(allocator: Allocator, width: u32, height: u32) !Self {
-        const temp_image = try RgbaImage.init(allocator, width, height);
+        const temp_image = try RgbImageSoA.init(allocator, width, height);
         return .{ .temp_image = temp_image, .allocator = allocator };
     }
 
@@ -390,55 +435,67 @@ const Sharpener = struct {
         if (level == 0) {
             return;
         }
-        comptime var vec_size = std.simd.suggestVectorSize(u8) orelse unreachable;
+        comptime var vec_size = std.simd.suggestVectorSize(i16) orelse unreachable;
+        const Vec = @Vector(vec_size, i16);
 
         const filter = [_]i8{ 0, -1, 0, -1, 5, -1, 0, -1, 0 };
-        const filter16 = [_]i16{ 0, -1, 0, -1, 5, -1, 0, -1, 0 };
-        std.mem.copy(u8, self.temp_image.data, image.data);
+        // const filter16 = [_]i16{ 0, -1, 0, -1, 5, -1, 0, -1, 0 };
+        self.temp_image.fromRgbaImage(image);
 
-        for (0..image.height) |y| {
-            var x: usize = 0;
-            while (x + vec_size < image.width - 3) : (x += vec_size) {
-                var processed_r = @splat(vec_size, @as(i16, 0));
-                var processed_g = @splat(vec_size, @as(i16, 0));
-                var processed_b = @splat(vec_size, @as(i16, 0));
-                for (0..3) |fy| {
-                    if ((fy == 0 and y == 0) or (fy == 2 and y + 1 == image.height)) {
-                        continue;
-                    }
-                    for (0..3) |fx| {
-                        const f = @splat(vec_size, @as(i16, filter16[fy * 3 + fx]));
-                        const vec8: @Vector(vec_size * 4, u8) = self.temp_image.data[(y + fy - 1) * image.width * 4 + (x + fx - 1) * 4 ..][0 .. vec_size * 4].*;
-                        const rgba8 = std.simd.deinterlace(4, vec8);
-                        const r = @intCast(@Vector(vec_size, i16), rgba8[0]);
-                        const g = @intCast(@Vector(vec_size, i16), rgba8[1]);
-                        const b = @intCast(@Vector(vec_size, i16), rgba8[2]);
-                        processed_r += r * f;
-                        processed_g += g * f;
-                        processed_b += b * f;
-                    }
-                }
-                const original_vec8: @Vector(vec_size * 4, u8) = self.temp_image.data[y * image.width * 4 + x * 4 ..][0 .. vec_size * 4].*;
-                const original_vec16 = @intCast(@Vector(vec_size * 4, i16), original_vec8);
-                const original_rgba = std.simd.deinterlace(4, original_vec16);
+        for (1..image.height - 1) |y| {
+            var x: usize = 1;
 
-                const level_vec = @splat(vec_size, @as(i16, level));
-                const level2_vec = @splat(vec_size, @as(i16, 128 - level));
-                const vec7 = @splat(vec_size, @as(i16, 7));
-                const blend_r = (processed_r * level_vec + original_rgba[0] * level2_vec) >> vec7;
-                const blend_g = (processed_g * level_vec + original_rgba[1] * level2_vec) >> vec7;
-                const blend_b = (processed_b * level_vec + original_rgba[2] * level2_vec) >> vec7;
+            var prev_r: Vec = self.temp_image.r[y * image.width ..][0..vec_size].*;
+            var prev_g: Vec = self.temp_image.g[y * image.width ..][0..vec_size].*;
+            var prev_b: Vec = self.temp_image.b[y * image.width ..][0..vec_size].*;
+            var cur_r: Vec = self.temp_image.r[y * image.width + 1 ..][0..vec_size].*;
+            var cur_g: Vec = self.temp_image.g[y * image.width + 1 ..][0..vec_size].*;
+            var cur_b: Vec = self.temp_image.b[y * image.width + 1 ..][0..vec_size].*;
+
+            while (x + vec_size < image.width - 1) : (x += vec_size) {
+                const next_r: Vec = self.temp_image.r[y * image.width + x + 1 ..][0..vec_size].*;
+                const next_g: Vec = self.temp_image.g[y * image.width + x + 1 ..][0..vec_size].*;
+                const next_b: Vec = self.temp_image.b[y * image.width + x + 1 ..][0..vec_size].*;
+                const up_r: Vec = self.temp_image.r[(y - 1) * image.width + x ..][0..vec_size].*;
+                const up_g: Vec = self.temp_image.g[(y - 1) * image.width + x ..][0..vec_size].*;
+                const up_b: Vec = self.temp_image.b[(y - 1) * image.width + x ..][0..vec_size].*;
+                const down_r: Vec = self.temp_image.r[(y + 1) * image.width + x ..][0..vec_size].*;
+                const down_g: Vec = self.temp_image.g[(y + 1) * image.width + x ..][0..vec_size].*;
+                const down_b: Vec = self.temp_image.b[(y + 1) * image.width + x ..][0..vec_size].*;
+
+                const vec5 = @splat(vec_size, @as(i16, 5));
+                const processed_r = cur_r * vec5 - (prev_r + next_r + up_r + down_r);
+                const processed_g = cur_g * vec5 - (prev_g + next_g + up_g + down_g);
+                const processed_b = cur_b * vec5 - (prev_b + next_b + up_b + down_b);
 
                 const vec255 = @splat(vec_size, @as(i16, 255));
                 const vec0 = @splat(vec_size, @as(i16, 0));
-                const blend_r8 = @intCast(@Vector(vec_size, u8), @max(vec0, @min(vec255, blend_r)));
-                const blend_g8 = @intCast(@Vector(vec_size, u8), @max(vec0, @min(vec255, blend_g)));
-                const blend_b8 = @intCast(@Vector(vec_size, u8), @max(vec0, @min(vec255, blend_b)));
+                const clamped_r = @max(vec0, @min(vec255, processed_r));
+                const clamped_g = @max(vec0, @min(vec255, processed_g));
+                const clamped_b = @max(vec0, @min(vec255, processed_b));
+
+                const level_vec = @splat(vec_size, @as(i16, level));
+                const level2_vec = @splat(vec_size, @as(i16, 64 - level));
+                const shift_vec = @splat(vec_size, @as(i16, 6));
+                const blend_r = (clamped_r * level_vec + cur_r * level2_vec) >> shift_vec;
+                const blend_g = (clamped_g * level_vec + cur_g * level2_vec) >> shift_vec;
+                const blend_b = (clamped_b * level_vec + cur_b * level2_vec) >> shift_vec;
+
+                const blend_r8 = @intCast(@Vector(vec_size, u8), blend_r);
+                const blend_g8 = @intCast(@Vector(vec_size, u8), blend_g);
+                const blend_b8 = @intCast(@Vector(vec_size, u8), blend_b);
                 const blend_a8 = @splat(vec_size, @as(u8, 255));
 
                 const blend = std.simd.interlace(.{ blend_r8, blend_g8, blend_b8, blend_a8 });
 
                 image.data[y * image.width * 4 + x * 4 ..][0 .. vec_size * 4].* = blend;
+
+                prev_r = cur_r;
+                prev_g = cur_g;
+                prev_b = cur_b;
+                cur_r = next_r;
+                cur_g = next_g;
+                cur_b = next_b;
             }
             while (x < image.width) : (x += 1) {
                 var processed = RgbI32.init();
@@ -453,7 +510,7 @@ const Sharpener = struct {
                         }
 
                         const f = filter[fy * 3 + fx];
-                        const original = self.temp_image.getRgb(((y + fy - 1) * image.width + (x + fx - 1)) * 4);
+                        const original = image.getRgb(((y + fy - 1) * image.width + (x + fx - 1)) * 4);
                         processed.r += @intCast(i32, original.r) * f;
                         processed.g += @intCast(i32, original.g) * f;
                         processed.b += @intCast(i32, original.b) * f;
@@ -462,7 +519,7 @@ const Sharpener = struct {
                 processed.clamp();
 
                 const i = (y * image.width + x) * 4;
-                const original = self.temp_image.getRgb(i);
+                const original = image.getRgb(i);
                 image.setRgb(i, processed.blend(original, level));
             }
         }
@@ -470,11 +527,11 @@ const Sharpener = struct {
 };
 
 test "Process image" {
-    var la = try LightAdjustment.init(test_allocator, 2, 2);
+    var la = try LightAdjustment.init(test_allocator, 32, 32);
     defer la.deinit();
 
-    std.mem.copy(u8, la.image.data, &[_]u8{ 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255 });
-    std.mem.copy(u8, la.mask.data, &[_]u8{ 0, 255, 10, 200 });
+    std.mem.copy(u8, la.image.data, &([_]u8{ 1, 2, 3, 255, 4, 5, 6, 255, 7, 8, 9, 255, 10, 11, 12, 255 } ** 256));
+    std.mem.copy(u8, la.mask.data, &([_]u8{ 0, 255, 10, 200 } ** 256));
 
     // 最初は常に状態の更新が必要
     try expect(la.isStateObsolete());
