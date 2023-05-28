@@ -429,7 +429,7 @@ const Sharpener = struct {
         self.temp_image.deinit();
     }
 
-    // TODO(sile): SIMD で高速化できないかどうかを試す
+    // TODO(sile): 端の処理
     fn processImage(self: *const Self, image: *RgbaImage, options: *const LightAdjustmentOptions) void {
         const level = options.sharpness_level;
         if (level == 0) {
@@ -445,28 +445,27 @@ const Sharpener = struct {
         for (1..image.height - 1) |y| {
             var x: usize = 1;
 
-            var prev_r: Vec = self.temp_image.r[y * image.width ..][0..vec_size].*;
-            var prev_g: Vec = self.temp_image.g[y * image.width ..][0..vec_size].*;
-            var prev_b: Vec = self.temp_image.b[y * image.width ..][0..vec_size].*;
-            var cur_r: Vec = self.temp_image.r[y * image.width + 1 ..][0..vec_size].*;
-            var cur_g: Vec = self.temp_image.g[y * image.width + 1 ..][0..vec_size].*;
-            var cur_b: Vec = self.temp_image.b[y * image.width + 1 ..][0..vec_size].*;
-
             while (x + vec_size < image.width - 1) : (x += vec_size) {
-                const next_r: Vec = self.temp_image.r[y * image.width + x + 1 ..][0..vec_size].*;
-                const next_g: Vec = self.temp_image.g[y * image.width + x + 1 ..][0..vec_size].*;
-                const next_b: Vec = self.temp_image.b[y * image.width + x + 1 ..][0..vec_size].*;
-                const up_r: Vec = self.temp_image.r[(y - 1) * image.width + x ..][0..vec_size].*;
-                const up_g: Vec = self.temp_image.g[(y - 1) * image.width + x ..][0..vec_size].*;
-                const up_b: Vec = self.temp_image.b[(y - 1) * image.width + x ..][0..vec_size].*;
-                const down_r: Vec = self.temp_image.r[(y + 1) * image.width + x ..][0..vec_size].*;
-                const down_g: Vec = self.temp_image.g[(y + 1) * image.width + x ..][0..vec_size].*;
-                const down_b: Vec = self.temp_image.b[(y + 1) * image.width + x ..][0..vec_size].*;
+                const lr: Vec = self.temp_image.r[y * image.width + x - 1 ..][0..vec_size].*;
+                const lg: Vec = self.temp_image.g[y * image.width + x - 1 ..][0..vec_size].*;
+                const lb: Vec = self.temp_image.b[y * image.width + x - 1 ..][0..vec_size].*;
+                const cr: Vec = self.temp_image.r[y * image.width + x ..][0..vec_size].*;
+                const cg: Vec = self.temp_image.g[y * image.width + x ..][0..vec_size].*;
+                const cb: Vec = self.temp_image.b[y * image.width + x ..][0..vec_size].*;
+                const rr: Vec = self.temp_image.r[y * image.width + x + 1 ..][0..vec_size].*;
+                const rg: Vec = self.temp_image.g[y * image.width + x + 1 ..][0..vec_size].*;
+                const rb: Vec = self.temp_image.b[y * image.width + x + 1 ..][0..vec_size].*;
+                const tr: Vec = self.temp_image.r[(y - 1) * image.width + x ..][0..vec_size].*;
+                const tg: Vec = self.temp_image.g[(y - 1) * image.width + x ..][0..vec_size].*;
+                const tb: Vec = self.temp_image.b[(y - 1) * image.width + x ..][0..vec_size].*;
+                const br: Vec = self.temp_image.r[(y + 1) * image.width + x ..][0..vec_size].*;
+                const bg: Vec = self.temp_image.g[(y + 1) * image.width + x ..][0..vec_size].*;
+                const bb: Vec = self.temp_image.b[(y + 1) * image.width + x ..][0..vec_size].*;
 
                 const vec5 = @splat(vec_size, @as(i16, 5));
-                const processed_r = cur_r * vec5 - (prev_r + next_r + up_r + down_r);
-                const processed_g = cur_g * vec5 - (prev_g + next_g + up_g + down_g);
-                const processed_b = cur_b * vec5 - (prev_b + next_b + up_b + down_b);
+                const processed_r = cr * vec5 - (lr + rr + tr + br);
+                const processed_g = cg * vec5 - (lg + rg + tg + bg);
+                const processed_b = cb * vec5 - (lb + rb + tb + bb);
 
                 const vec255 = @splat(vec_size, @as(i16, 255));
                 const vec0 = @splat(vec_size, @as(i16, 0));
@@ -477,9 +476,9 @@ const Sharpener = struct {
                 const level_vec = @splat(vec_size, @as(i16, level));
                 const level2_vec = @splat(vec_size, @as(i16, 64 - level));
                 const shift_vec = @splat(vec_size, @as(i16, 6));
-                const blend_r = (clamped_r * level_vec + cur_r * level2_vec) >> shift_vec;
-                const blend_g = (clamped_g * level_vec + cur_g * level2_vec) >> shift_vec;
-                const blend_b = (clamped_b * level_vec + cur_b * level2_vec) >> shift_vec;
+                const blend_r = (clamped_r * level_vec + cr * level2_vec) >> shift_vec;
+                const blend_g = (clamped_g * level_vec + cg * level2_vec) >> shift_vec;
+                const blend_b = (clamped_b * level_vec + cb * level2_vec) >> shift_vec;
 
                 const blend_r8 = @intCast(@Vector(vec_size, u8), blend_r);
                 const blend_g8 = @intCast(@Vector(vec_size, u8), blend_g);
@@ -489,13 +488,6 @@ const Sharpener = struct {
                 const blend = std.simd.interlace(.{ blend_r8, blend_g8, blend_b8, blend_a8 });
 
                 image.data[y * image.width * 4 + x * 4 ..][0 .. vec_size * 4].* = blend;
-
-                prev_r = cur_r;
-                prev_g = cur_g;
-                prev_b = cur_b;
-                cur_r = next_r;
-                cur_g = next_g;
-                cur_b = next_b;
             }
             while (x < image.width) : (x += 1) {
                 var processed = RgbI32.init();
