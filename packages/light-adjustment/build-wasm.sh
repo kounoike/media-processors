@@ -3,7 +3,7 @@
 set -eux
 
 cd zig/
-zig build -Doptimize=ReleaseFast -Dtarget=wasm32-freestanding -Dcpu=bleeding_edge
+zig build -Doptimize=ReleaseFast -Dtarget=wasm32-freestanding -Dcpu=mvp+simd128
 cd ..
 
 mkdir -p dist/
