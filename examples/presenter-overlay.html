@@ -1,0 +1,104 @@
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>Media Processors: プレゼンターオーバーレイサンプル</title>
+  </head>
+  <body>
+    <h1>Media Processors: プレゼンターオーバーレイサンプル</h1>
+
+    <h3>入力設定</h3>
+    解像度: <input id="videoWidth" type="text" value="1920">x<input id="videoHeight" type="text" value="1080"><br />
+    FPS: <input id="videoFps" type="text" value="30"><br />
+    入力カメラデバイス: <select id="videoDevice" size="1"><option>未指定</option></select>
+
+    <input type="button" value="ON" onClick="showProcessedVideo()">
+    <input type="button" value="OFF" onClick="showOriginalVideo()">
+    <br />
+    フレーム処理時間: <span id="elapsed">0.0</span> 秒 フレームレート: <span id="fps">0.0</span>FPS<br />
+    <br />
+
+    <video id="video" autoplay playsinline></video>
+    <video id="screen" autoplay playsinline style="display: none;"></video>
+
+    <script src="./presenter-overlay/presenter_overlay.js"></script>
+    <script>
+      if (!Shiguredo.PresenterOverlayProcessor.isSupported()) {
+          alert("Unsupported platform");
+          throw Error("Unsupported platform");
+      }
+
+      const assetsPath = "./presenter-overlay/";
+      const processor = new Shiguredo.PresenterOverlayProcessor(assetsPath);
+      setInterval(() => {
+          const elapsed = processor.getAverageProcessedTimeMs() / 1000;
+          document.getElementById('elapsed').innerText = elapsed.toFixed(4).padStart(4, '0');
+          const fps = processor.getFps();
+          document.getElementById('fps').innerText = fps.toFixed(2).padStart(5, '0');
+      }, 300);
+
+      function getUserMedia() {
+          const constraints = {
+              width: document.getElementById("videoWidth").value,
+              height: document.getElementById("videoHeight").value,
+              frameRate: {ideal: document.getElementById("videoFps").value},
+              deviceId: document.getElementById("videoDevice").value,
+          };
+          return navigator.mediaDevices.getUserMedia({video: constraints}).then((result) => {
+              updateDeviceList();
+              return result;
+          });
+      }
+
+      let isFirst = true;
+      function updateDeviceList() {
+          if (!isFirst) {
+              return;
+          }
+          isFirst = false;
+
+          navigator.mediaDevices.enumerateDevices().then((devices) => {
+              const videoDevices = devices.filter((device) => device.kind === "videoinput" && device.label);
+              const select = document.getElementById("videoDevice");
+              videoDevices.forEach((device) => {
+                  const option = document.createElement("option");
+                  option.value = device.deviceId;
+                  option.text = device.label;
+                  select.appendChild(option);
+              });
+          });
+      }
+
+      function showOriginalVideo() {
+          processor.stopProcessing();
+
+          const videoElement = document.getElementById('video');
+          getUserMedia().then((stream) => {
+              videoElement.srcObject = stream;
+          });
+      }
+
+      function showProcessedVideo() {
+          processor.stopProcessing();
+
+          const videoElement = document.getElementById('video');
+          const screenElement = document.getElementById('screen');
+          getUserMedia().then((stream) => {
+              const track = stream.getVideoTracks()[0];
+              navigator.mediaDevices.getDisplayMedia().then((screenStream) => {
+                  screenElement.onloadedmetadata = () => {
+                      screenElement.width = screenElement.videoWidth;
+                      screenElement.height = screenElement.videoHeight;
+                  }
+                  screenElement.srcObject = screenStream;
+                  let options = {screen: screenElement, dx: 600, dy: 50, dw: 1280, dh: 720};
+                  processor.startProcessing(track, options).then((processed_track) => {
+                      videoElement.srcObject = new MediaStream([processed_track]);
+                  });
+              })
+          });
+      }
+
+      showOriginalVideo();
+    </script>
+  </body>
+</html>

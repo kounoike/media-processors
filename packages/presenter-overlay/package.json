@@ -1,0 +1,51 @@
+{
+  "name": "@shiguredo/presenter-overlay",
+  "version": "2023.2.0",
+  "description": "Virtual Background Library",
+  "author": "Shiguredo Inc.",
+  "license": "Apache-2.0",
+  "main": "dist/presenter_overlay.js",
+  "module": "dist/presenter_overlay.mjs",
+  "types": "dist/presenter_overlay.d.ts",
+  "scripts": {
+    "build": "rollup -c ./rollup.config.mjs --bundleConfigAsCjs && tsc --emitDeclarationOnly",
+    "lint": "eslint --ext .ts ./src",
+    "fmt": "prettier --write src",
+    "doc": "typedoc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shiguredo/media-processors.git"
+  },
+  "keywords": [
+    "presenter-overlay"
+  ],
+  "bugs": {
+    "url": "https://discord.gg/shiguredo"
+  },
+  "homepage": "https://github.com/shiguredo/media-processors#readme",
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "@types/dom-mediacapture-transform": "^0.1.4"
+  },
+  "devDependencies": {
+    "@shiguredo/video-track-processor": "../video-track-processor/",
+    "@mediapipe/selfie_segmentation": "0.1.1675465747",
+    "@rollup/plugin-commonjs": "25.0.3",
+    "@rollup/plugin-node-resolve": "15.1.0",
+    "@rollup/plugin-typescript": "11.1.2",
+    "@types/offscreencanvas": "2019.7.0",
+    "@typescript-eslint/eslint-plugin": "5.62.0",
+    "@typescript-eslint/parser": "5.62.0",
+    "eslint": "8.45.0",
+    "eslint-config-prettier": "8.8.0",
+    "eslint-plugin-prettier": "4.2.1",
+    "rollup": "3.26.2",
+    "rollup-plugin-copy": "3.4.0",
+    "stackblur-canvas": "2.6.0",
+    "typedoc": "0.24.7",
+    "typescript": "5.0.4"
+  }
+}

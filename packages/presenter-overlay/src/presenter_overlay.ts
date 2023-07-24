@@ -1,0 +1,348 @@
+import { VideoTrackProcessor } from "@shiguredo/video-track-processor";
+import {
+  SelfieSegmentation,
+  SelfieSegmentationConfig,
+  Results as SelfieSegmentationResults,
+} from "@mediapipe/selfie_segmentation";
+import * as StackBlur from "stackblur-canvas";
+
+/**
+ * {@link PresenterOverlayProcessor.startProcessing} メソッドに指定可能なオプション
+ */
+interface PresenterOverlayProcessorOptions {
+  /**
+   * 表示するプレゼンテーション
+   *
+   */
+  screen: HTMLVideoElement;
+
+  /**
+   * 表示位置
+   */
+  dx: number;
+  dy: number;
+  dw: number;
+  dh: number;
+
+  /**
+   * セグメンテーションに使用するモデル
+   *
+   * デフォルトでは"selfie-landscape"が使用されます。
+   * それぞれのモデルの詳細については
+   * [MediaPipe Selfie Segmentation](https://google.github.io/mediapipe/solutions/selfie_segmentation.html)
+   * を参照してください。
+   */
+  segmentationModel?: "selfie-landscape" | "selfie-general";
+
+  /**
+   * 背景画像のどの領域を使用するかを決定する関数
+   *
+   * 背景画像と処理対象映像のアスペクト比が異なる場合の扱いを決定するために使用されます
+   *
+   * デフォルトでは、背景画像のアスペクト比を維持したまま中央部分を切り抜く {@link cropBackgroundImageCenter} が使われます
+   */
+  backgroundImageRegion?: (videoFrame: ImageSize, backgroundImage: ImageSize) => ImageRegion;
+}
+
+/**
+ * 画像の幅と高さ
+ */
+interface ImageSize {
+  width: number;
+  height: number;
+}
+
+/**
+ * 画像の領域（始点とサイズ）
+ */
+interface ImageRegion {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * 背景画像と処理対象映像のアスペクトが異なる場合に、背景画像の中央部分を切り抜いた領域を返します
+ *
+ * これは {@link PresenterOverlayProcessorOptions.backgroundImageRegion} オプションのデフォルトの挙動です
+ */
+function cropBackgroundImageCenter(videoFrame: ImageSize, backgroundImage: ImageSize): ImageRegion {
+  let x = 0;
+  let y = 0;
+  let width = backgroundImage.width;
+  let height = backgroundImage.height;
+
+  const videoFrameRatio = videoFrame.width / videoFrame.height;
+  const backgroundImageRatio = backgroundImage.width / backgroundImage.height;
+  if (backgroundImageRatio < videoFrameRatio) {
+    const newHeight = videoFrame.height * (backgroundImage.width / videoFrame.width);
+    y = Math.round((height - newHeight) / 2);
+    height = Math.round(newHeight);
+  } else if (backgroundImageRatio > videoFrameRatio) {
+    const newWidth = videoFrame.width * (backgroundImage.height / videoFrame.height);
+    x = Math.round((width - newWidth) / 2);
+    width = Math.round(newWidth);
+  }
+
+  return { x, y, width, height };
+}
+
+/**
+ * 常に背景画像の全領域を返します
+ *
+ * これは {@link PresenterOverlayProcessorOptions.backgroundImageRegion} オプションに指定可能な関数で、
+ * 背景画像と処理対象映像のアスペクト比が異なる場合には、背景画像が映像に合わせて引き伸ばされます
+ */
+function fillBackgroundImage(_videoFrame: ImageSize, backgroundImage: ImageSize): ImageRegion {
+  return { x: 0, y: 0, width: backgroundImage.width, height: backgroundImage.height };
+}
+
+/**
+ * 映像トラックに仮想背景処理を適用するためのプロセッサ
+ */
+class PresenterOverlayProcessor {
+  private trackProcessor: VideoTrackProcessor;
+  private segmentation: SelfieSegmentation;
+
+  /**
+   * {@link PresenterOverlayProcessor} インスタンスを生成します
+   *
+   * @param assetsPath wasm 等のファイルの配置先ディレクトリパスないしURL
+   */
+  constructor(assetsPath: string) {
+    this.trackProcessor = new VideoTrackProcessor();
+
+    // セグメンテーションモデルのロード準備
+    const config: SelfieSegmentationConfig = {};
+    assetsPath = trimLastSlash(assetsPath);
+    config.locateFile = (file: string) => {
+      return `${assetsPath}/${file}`;
+    };
+    this.segmentation = new SelfieSegmentation(config);
+  }
+
+  /**
+   * 実行環境が必要な機能をサポートしているかどうかを判定します
+   *
+   * 以下のいずれかが利用可能である必要があります:
+   * - MediaStreamTrack Insertable Streams (aka. Breakout Box)
+   * - HTMLVideoElement.requestVideoFrameCallback
+   *
+   * @returns サポートされているかどうか
+   */
+  static isSupported(): boolean {
+    return VideoTrackProcessor.isSupported();
+  }
+
+  /**
+   * 仮想背景処理の適用を開始します
+   *
+   * @param track 処理適用対象となる映像トラック
+   * @param options 各種オプション
+   *
+   * @returns 処理適用後の映像トラック
+   *
+   * @throws
+   * 既にあるトラックを処理中の場合には、エラーが送出されます
+   *
+   * 処理中かどうかは {@link PresenterOverlayProcessor.isProcessing} で判定可能です
+   */
+  async startProcessing(
+    track: MediaStreamVideoTrack,
+    options: PresenterOverlayProcessorOptions
+  ): Promise<MediaStreamVideoTrack> {
+    const initialWidth = track.getSettings().width || 0;
+    const initialHeight = track.getSettings().height || 0;
+    const canvas = createOffscreenCanvas(initialWidth, initialHeight);
+    const canvasCtx = canvas.getContext("2d", {
+      desynchronized: true,
+      willReadFrequently: false, // ここをtrueにするとCPU-GPUメモリ転送が発生して遅くなる
+    }) as OffscreenCanvasRenderingContext2D | null;
+    if (canvasCtx === null) {
+      throw Error("Failed to create 2D canvas context");
+    }
+
+    // セグメンテーションモデルを準備
+    await this.segmentation.initialize();
+    let modelSelection = 1; // `1` means "selfie-landscape".
+    if (options.segmentationModel && options.segmentationModel === "selfie-general") {
+      modelSelection = 0;
+    }
+    this.segmentation.setOptions({ modelSelection });
+    this.segmentation.onResults((results) => {
+      const { width, height } = results.segmentationMask;
+      resizeCanvasIfNeed(width, height, canvas);
+      this.updateOffscreenCanvas(results, canvasCtx, options);
+    });
+
+    // 仮想背景処理を開始
+    return this.trackProcessor.startProcessing(track, async (image: ImageBitmap | HTMLVideoElement) => {
+      // @ts-ignore TS2322: 「`image`の型が合っていない」と怒られるけれど、動作はするので一旦無視
+      await this.segmentation.send({ image });
+
+      return canvas;
+    });
+  }
+
+  /**
+   * 仮想背景処理の適用を停止します
+   *
+   * コンストラクタに渡された映像トラックは閉じないので、
+   * 必要であれば、別途呼び出し側で対処する必要があります
+   */
+  stopProcessing() {
+    this.trackProcessor.stopProcessing();
+    this.segmentation.onResults(() => {});
+  }
+
+  /**
+   * 仮想背景処理が実行中かどうかを判定します
+   *
+   * @returns 実行中であれば `true` 、そうでなければ `false`
+   */
+  isProcessing(): boolean {
+    return this.trackProcessor.isProcessing();
+  }
+
+  /**
+   * 処理適用前の映像トラックを返します
+   *
+   * これは {@link PresenterOverlayProcessor.startProcessing} に渡したトラックと等しいです
+   *
+   * {@link PresenterOverlayProcessor.startProcessing} 呼び出し前、あるいは、
+   * {@link PresenterOverlayProcessor.stopProcessing} 呼び出し後には `undefined` が返されます
+   *
+   * @returns 処理適用中の場合は映像トラック、それ以外なら `undefined`
+   */
+  getOriginalTrack(): MediaStreamVideoTrack | undefined {
+    return this.trackProcessor.getOriginalTrack();
+  }
+
+  /**
+   * 処理適用後の映像トラックを返します
+   *
+   * これは {@link PresenterOverlayProcessor.startProcessing} が返したトラックと等しいです
+   *
+   * {@link PresenterOverlayProcessor.startProcessing} 呼び出し前、あるいは、
+   * {@link PresenterOverlayProcessor.stopProcessing} 呼び出し後には `undefined` が返されます
+   *
+   * @returns 処理適用中の場合は映像トラック、それ以外なら `undefined`
+   */
+  getProcessedTrack(): MediaStreamVideoTrack | undefined {
+    return this.trackProcessor.getProcessedTrack();
+  }
+
+  /**
+   * 平均フレームレートを返します
+   *
+   * 処理開始直後は実際の値と異なる値が返されます
+   *
+   * @returns 平均フレームレート
+   */
+  getFps(): number {
+    return this.trackProcessor.getFps();
+  }
+
+  /**
+   * フレームの平均処理時間を返します
+   *
+   * 処理開始直後は実際の値と異なる値が返されます
+   *
+   * @returns 平均処理時間 (ミリ秒)
+   */
+  getAverageProcessedTimeMs(): number {
+    return this.trackProcessor.getAverageProcessedTimeMs();
+  }
+
+  private updateOffscreenCanvas(
+    segmentationResults: SelfieSegmentationResults,
+    canvasCtx: OffscreenCanvasRenderingContext2D,
+    options: PresenterOverlayProcessorOptions
+  ) {
+    const { width, height } = segmentationResults.image;
+
+    canvasCtx.save();
+    canvasCtx.clearRect(0, 0, width, height);
+    canvasCtx.drawImage(segmentationResults.segmentationMask, 0, 0, width, height);
+
+    canvasCtx.globalCompositeOperation = "source-in";
+    canvasCtx.drawImage(segmentationResults.image, 0, 0, width, height);
+
+    // NOTE: mediapipeの例 (https://google.github.io/mediapipe/solutions/selfie_segmentation.html) では、
+    //       "destination-atop"が使われているけれど、背景画像にアルファチャンネルが含まれている場合には、
+    //       "destination-atop"だと透過部分と人物が重なる領域が除去されてしまうので、
+    //       "destination-over"にしている。
+    canvasCtx.globalCompositeOperation = "destination-over";
+    canvasCtx.filter = "drop-shadow(0 0 0.75rem rgba(0, 0, 0, 0.8))";
+
+    canvasCtx.drawImage(
+      options.screen,
+      0,
+      0,
+      options.screen.width,
+      options.screen.height,
+      options.dx,
+      options.dy,
+      options.dw,
+      options.dh
+    );
+    canvasCtx.filter = "";
+
+    canvasCtx.drawImage(segmentationResults.image, 0, 0);
+
+    canvasCtx.restore();
+  }
+}
+
+function resizeCanvasIfNeed(width: number, height: number, canvas: OffscreenCanvas | HTMLCanvasElement) {
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+}
+
+function trimLastSlash(s: string): string {
+  if (s.slice(-1) === "/") {
+    return s.slice(0, -1);
+  }
+  return s;
+}
+
+// TODO(sile): Safari 16.4 から OffscreenCanvas に対応したので、そのうちにこの関数は削除する
+function createOffscreenCanvas(width: number, height: number): OffscreenCanvas | HTMLCanvasElement {
+  if (typeof OffscreenCanvas === "undefined") {
+    // OffscreenCanvas が使えない場合には通常の canvas で代替する
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    return canvas;
+  } else {
+    return new OffscreenCanvas(width, height);
+  }
+}
+
+function browser(): string {
+  const ua = window.navigator.userAgent.toLocaleLowerCase();
+  if (ua.indexOf("edge") !== -1) {
+    return "edge";
+  } else if (ua.indexOf("chrome") !== -1 && ua.indexOf("edge") === -1) {
+    return "chrome";
+  } else if (ua.indexOf("safari") !== -1 && ua.indexOf("chrome") === -1) {
+    return "safari";
+  } else if (ua.indexOf("opera") !== -1) {
+    return "opera";
+  } else if (ua.indexOf("firefox") !== -1) {
+    return "firefox";
+  }
+  return "unknown";
+}
+
+export {
+  PresenterOverlayProcessorOptions,
+  PresenterOverlayProcessor,
+  ImageRegion,
+  ImageSize,
+  cropBackgroundImageCenter,
+  fillBackgroundImage,
+};
